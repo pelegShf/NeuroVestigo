@@ -81,6 +81,14 @@ def cmd_train(args):
         config.early_stopping_patience = args.patience
     if args.seed is not None:
         config.seed = args.seed
+    if args.memdel_p is not None:
+        config.memdel_p = args.memdel_p
+    if args.memdel_mode is not None:
+        config.memdel_mode = args.memdel_mode
+    if args.memdel_keep is not None:
+        config.memdel_keep = args.memdel_keep
+    if args.init_lora is not None:
+        config.init_lora = args.init_lora
 
     # ----- LoRA -----
     if args.lora_rank is not None:
@@ -421,6 +429,14 @@ def main():
             "Example: --resume checkpoints/train_state.pt"
         ),
     )
+
+    p_train.add_argument("--memdel-p", type=float, default=None,
+                         help="memory-omission training: share of clips whose memory has recent growth deleted")
+    p_train.add_argument("--memdel-mode", choices=["window", "all"], default=None)
+    p_train.add_argument("--memdel-keep", type=float, default=None,
+                         help="share of growth components deleted in a corrupted clip")
+    p_train.add_argument("--init-lora", type=str, default=None, metavar="PATH",
+                         help="start from these LoRA weights (fine-tune) instead of zero init")
 
     args = parser.parse_args()
 

@@ -40,6 +40,7 @@ from src.lora import (
     apply_lora,
     get_trainable_parameters,
     save_lora_weights,
+    load_lora_weights,
     save_train_state,
     load_train_state,
     SAM2_LORA_TARGETS,
@@ -55,6 +56,7 @@ from src.neuron_dataset import (
 from src.augmentations import VideoAugmentation, VideoValidationTransform
 from src.evaluate import validate_epoch
 from src.loss_fns import MultiStepMultiMasksAndIous
+from src import memory_corruption
 from src.data_utils import BatchedVideoDatapoint
 
 
@@ -275,6 +277,9 @@ class SAM2TrainingWrapper(nn.Module):
         use_prompt_distill: bool = False,
         distill_frames_per_clip: int = 4,
         distill_start_epoch: int = 0,
+        memdel_p: float = 0.0,
+        memdel_mode: str = "window",
+        memdel_keep: float = 0.7,
     ):
         super().__init__()
         self.model = sam2_model
@@ -289,6 +294,14 @@ class SAM2TrainingWrapper(nn.Module):
         self.distill_frames_per_clip = distill_frames_per_clip
         self.distill_start_epoch = distill_start_epoch
         self.current_epoch = 0
+        # Memory-omission training (src/memory_corruption.py). Off at p=0, in
+        # which case the RNG is never touched and the forward is unchanged.
+        self.memdel_p = memdel_p
+        self.memdel_mode = memdel_mode
+        self.memdel_keep = memdel_keep
+        self.memdel_fracs: List[float] = []
+        if memdel_p > 0:
+            memory_corruption.install(self.model)
 
         # When the memory path is active, force the SAM decoder to be exercised
         # on the conditioning frame too. By default SAM 2 has
@@ -516,6 +529,12 @@ class SAM2TrainingWrapper(nn.Module):
         distill_ts = self._distill_frames(T, frame0_prompt_dropped=drop_frame0_prompt)
         teacher_preds: List[torch.Tensor] = []
 
+        memdel, memdel_last = None, 0
+        if self.training and self.memdel_p > 0:
+            memdel, memdel_last, frac = memory_corruption.plan(
+                gt_masks, self.memdel_p, self.memdel_mode, self.memdel_keep)
+            self.memdel_fracs.append(frac)
+
         for t in range(T):
             # Slice frame-t features out of the B*T-batched backbone_out.
             # Layout is [clip0_t0, clip0_t1, ..., clip0_t(T-1), clip1_t0, ...]
@@ -547,6 +566,9 @@ class SAM2TrainingWrapper(nn.Module):
                     self._teacher_mask(vf_bn, fs, gt_masks[:, t].reshape(BN, 1, H, W).float())
                 )
 
+            if memdel is not None:
+                self.model._memdel = memdel if 1 <= t <= memdel_last else None
+
             out_t = self.model.track_step(
                 frame_idx=t,
                 is_init_cond_frame=(t == 0),
@@ -569,6 +591,9 @@ class SAM2TrainingWrapper(nn.Module):
 
             # pred_masks_high_res is [BN, 1, H, W]
             per_frame_preds.append(out_t["pred_masks_high_res"])
+
+        if memdel is not None:
+            self.model._memdel = None
 
         # Stack T frames: [BN, T, 1, H, W] -> squeeze -> [BN, T, H, W]
         preds = torch.stack(per_frame_preds, dim=1).squeeze(2)
@@ -930,7 +955,13 @@ def build_training_model(config: TrainingConfig, device: str):
         use_prompt_distill=config.loss.use_prompt_distill,
         distill_frames_per_clip=config.loss.distill_frames_per_clip,
         distill_start_epoch=config.loss.distill_start_epoch,
+        memdel_p=config.memdel_p,
+        memdel_mode=config.memdel_mode,
+        memdel_keep=config.memdel_keep,
     )
+    if config.memdel_p > 0:
+        print(f"  Memory-omission training: p={config.memdel_p} mode={config.memdel_mode} "
+              f"keep={config.memdel_keep}")
     if config.prompt_dropout > 0:
         print(f"  Frame-0 prompt dropout: p={config.prompt_dropout} "
               f"(ramped over {config.prompt_dropout_warmup_epochs} epochs)")
@@ -1286,6 +1317,9 @@ def train(config: TrainingConfig = None):
     # --- Model ---
     print("\n=== Model Setup ===")
     model, loss_fn = build_training_model(config, device)
+    if config.init_lora:
+        load_lora_weights(model.model, config.init_lora, device=device)
+        print(f"  Initialised LoRA from {config.init_lora}")
 
     # --- Feature Precomputation ---
     feature_cache = None
@@ -1516,6 +1550,11 @@ def train(config: TrainingConfig = None):
             f"time={epoch_time:.1f}s, "
             f"{avg_step_time_epoch:.1f}s/step"
         )
+        if model.memdel_fracs:
+            f = np.array(model.memdel_fracs)
+            print(f"  memdel: {np.mean(f > 0):.2f} of clips corrupted, "
+                  f"mean deleted share of GT(c) when corrupted {f[f > 0].mean() if (f > 0).any() else 0:.3f}")
+            model.memdel_fracs.clear()
         if train_components:
             comp_str = ", ".join(
                 f"{k.replace('loss_','')}={v:.3f}"

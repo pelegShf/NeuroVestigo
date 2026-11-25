@@ -441,6 +441,14 @@ class TrainingConfig:
     # the same probe shows the memory bank does essentially all the work --
     # 0.009 with neither prompt nor memory, ~0.830 with memory and no prompt.
     prompt_dropout: float = 0.0
+    # Memory-omission training (src/memory_corruption.py): probability a clip's
+    # memory writes have recent growth deleted; "window" or "all"; share of
+    # growth components deleted. 0 = off (bit-identical to before).
+    memdel_p: float = 0.0
+    memdel_mode: str = "window"
+    memdel_keep: float = 0.7
+    # LoRA weights to start from (fine-tuning) instead of the zero init.
+    init_lora: Optional[str] = None
     prompt_dropout_warmup_epochs: int = 40
 
     # --- historical note on the values above -------------------------------
